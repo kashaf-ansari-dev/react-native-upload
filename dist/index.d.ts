@@ -106,6 +106,47 @@ export interface ErrorData extends CompletedData {
     error: string;
 }
 export type UploadEventData = ProgressData | ErrorData | CancelledData | CompletedData;
+export type MultipartEventType = "progress" | "error" | "completed" | "cancelled";
+export interface MultipartS3Options {
+    /**
+     * Unique upload ID to track the upload.
+     */
+    uploadId: string;
+    /**
+     * Path to the local file to upload (e.g. /path/to/file or file:///path/to/file).
+     */
+    path: string;
+    /**
+     * Array of presigned URLs for each chunk in sequence.
+     */
+    parts: string[];
+    /**
+     * Maximum parallel chunk uploads (default: 3).
+     */
+    maxParallel?: number;
+    /**
+     * Notification options for background service (Android).
+     */
+    notification?: Partial<NotificationOptions>;
+    /**
+     * AppGroup defined in Xcode for extensions (iOS).
+     */
+    appGroup?: string;
+}
+export interface MultipartProgressEvent {
+    type: string;
+    uploadId: string;
+    progress?: number;
+    bytesUploaded?: number;
+    totalBytes?: number;
+    chunkIndex?: number;
+    errorMessage?: string;
+}
+export interface MultipartS3Result {
+    uploadId: string;
+    success: boolean;
+    etags: string[];
+}
 export declare const UploadState: {
     readonly Cancelled: "cancelled";
     readonly Completed: "completed";
@@ -154,6 +195,30 @@ declare class Upload {
     /**
      * Get all currently tracked uploads
      */
+    /**
+     * Create an S3 / Cloud multipart chunked upload instance
+     */
+    static createMultipartS3(options: MultipartS3Options): MultipartS3Upload;
+    /**
+     * Start an S3 / Cloud multipart chunked upload directly
+     */
+    static startMultipartS3(options: MultipartS3Options): Promise<MultipartS3Result>;
+    /**
+     * Cancel an ongoing S3 multipart upload
+     */
+    static cancelMultipartS3(uploadId: string): Promise<boolean>;
+    /**
+     * Pause an ongoing S3 multipart upload
+     */
+    static pauseMultipartS3(uploadId: string): Promise<boolean>;
+    /**
+     * Resume a paused S3 multipart upload
+     */
+    static resumeMultipartS3(uploadId: string): Promise<boolean>;
+    /**
+     * Add listener for multipart events
+     */
+    static addMultipartListener(eventType: MultipartEventType, uploadId: string, listener: (data: any) => void): EmitterSubscription;
     static getAll(): Upload[];
     /**
      * Set a callback to be called whenever the upload state changes
@@ -192,6 +257,33 @@ declare class Upload {
      */
     private cleanup;
 }
+declare class MultipartS3Upload {
+    private options;
+    private subscriptions;
+    private startPromise;
+    private progressCallbacks;
+    private static activeUploads;
+    constructor(options: MultipartS3Options);
+    static create(options: MultipartS3Options): MultipartS3Upload;
+    static getById(uploadId: string): MultipartS3Upload | undefined;
+    static cancel(uploadId: string): Promise<boolean>;
+    static pause(uploadId: string): Promise<boolean>;
+    static resume(uploadId: string): Promise<boolean>;
+    onProgress(callback: (event: MultipartProgressEvent) => void): this;
+    getId(): string;
+    getPath(): string;
+    start(): Promise<MultipartS3Result>;
+    private setupEventListeners;
+    cancel(): Promise<boolean>;
+    pause(): Promise<boolean>;
+    resume(): Promise<boolean>;
+    private cleanup;
+}
+export declare const startMultipartS3: (options: MultipartS3Options) => Promise<MultipartS3Result>;
+export declare const cancelMultipartS3: (uploadId: string) => Promise<boolean>;
+export declare const pauseMultipartS3: (uploadId: string) => Promise<boolean>;
+export declare const resumeMultipartS3: (uploadId: string) => Promise<boolean>;
+export declare const addMultipartListener: (eventType: MultipartEventType, uploadId: string, listener: (data: any) => void) => EmitterSubscription;
 export declare const getFileInfo: (path: string) => Promise<FileInfo>;
 export declare const startUpload: (options: UploadOptions) => Promise<string>;
 export declare const cancelUpload: (cancelUploadId: string) => Promise<boolean>;
@@ -199,6 +291,6 @@ export declare const addListener: (eventType: UploadEvent, uploadId: string, lis
 export declare const canSuspendIfBackground: () => void;
 export declare const shouldLimitNetwork: (limit: boolean) => void;
 export declare const getAllUploads: () => Promise<NativeUploadInfo[]>;
-export { Upload };
+export { Upload, MultipartS3Upload };
 export default Upload;
 //# sourceMappingURL=index.d.ts.map
