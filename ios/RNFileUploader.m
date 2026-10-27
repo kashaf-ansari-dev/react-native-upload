@@ -5,6 +5,7 @@
 #import <React/RCTEventEmitter.h>
 
 #import "RNFileUploader.h"
+#import "RNMultipartUploader.h"
 
 @implementation RNFileUploader
 
@@ -44,7 +45,9 @@ BOOL limitNetwork = NO;
 - (NSArray<NSString *> *)supportedEvents {
     return @[
         @"RNFileUploader-progress", @"RNFileUploader-error",
-        @"RNFileUploader-cancelled", @"RNFileUploader-completed"
+        @"RNFileUploader-cancelled", @"RNFileUploader-completed",
+        @"RNFileUploader-multipart-progress", @"RNFileUploader-multipart-error",
+        @"RNFileUploader-multipart-cancelled", @"RNFileUploader-multipart-completed"
     ];
 }
 
@@ -569,6 +572,39 @@ RCT_EXPORT_METHOD(getAllUploads : (RCTPromiseResolveBlock)
         NSLog(@"RNBU Did Finish Events For Background URLSession (no "
               @"backgroundSessionCompletionHandler)");
     }
+}
+
+
+RCT_EXPORT_METHOD(startMultipartUpload:(NSDictionary *)options
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    [[RNMultipartUploader sharedInstance] startUploadWithOptions:options
+                                                        resolver:resolve
+                                                        rejecter:reject
+                                                    eventEmitter:^(NSString *eventName, id body) {
+        [self _sendEventWithName:eventName body:body];
+    }];
+}
+
+RCT_EXPORT_METHOD(cancelMultipartUpload:(NSString *)uploadId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    BOOL cancelled = [[RNMultipartUploader sharedInstance] cancelUpload:uploadId];
+    resolve(@(cancelled));
+}
+
+RCT_EXPORT_METHOD(pauseMultipartUpload:(NSString *)uploadId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    BOOL paused = [[RNMultipartUploader sharedInstance] pauseUpload:uploadId];
+    resolve(@(paused));
+}
+
+RCT_EXPORT_METHOD(resumeMultipartUpload:(NSString *)uploadId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    BOOL resumed = [[RNMultipartUploader sharedInstance] resumeUpload:uploadId];
+    resolve(@(resumed));
 }
 
 @end
