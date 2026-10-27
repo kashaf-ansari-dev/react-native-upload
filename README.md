@@ -140,6 +140,58 @@ const options = {
 
 Note the `field` property is required for multipart uploads.
 
+## S3 / Cloud Multipart Upload (Chunked)
+
+For large files (e.g. > 25MB) that need to be uploaded in chunked parts to AWS S3, Google Cloud Storage, Cloudflare R2, or MinIO using presigned URLs:
+
+```typescript
+import Upload from "@ammarahmed/react-native-upload";
+
+const upload = Upload.createMultipartS3({
+  uploadId: "unique-upload-id-123",
+  path: "/path/to/large-video.mp4",
+  parts: [
+    "https://s3.amazonaws.com/bucket/file?partNumber=1&uploadId=...",
+    "https://s3.amazonaws.com/bucket/file?partNumber=2&uploadId=...",
+    // ... presigned URLs for each part
+  ],
+  maxParallel: 3, // Optional: maximum parallel chunk uploads (default: 3)
+  notification: {
+    enabled: true,
+    filename: "large-video.mp4", // Optional: human-readable name in notification
+  },
+  appGroup: "group.com.myapp", // Optional: iOS App Group for Share Extensions
+});
+
+// Track progress
+upload.onProgress((event) => {
+  console.log(`Uploaded ${event.bytesUploaded}/${event.totalBytes} bytes (${(event.progress * 100).toFixed(1)}%)`);
+  console.log(`Current chunk index: ${event.chunkIndex}`);
+});
+
+try {
+  const result = await upload.start();
+  if (result.success) {
+    // Array of ETags matching the order of the parts (for S3 CompleteMultipartUpload)
+    console.log("Upload completed with ETags:", result.etags);
+  }
+} catch (error) {
+  if (error.code === "CANCELLED") {
+    console.log("Upload was cancelled");
+  } else {
+    console.error("Upload failed:", error);
+  }
+}
+
+// To cancel mid-upload:
+// await upload.cancel();
+// or statically:
+// await Upload.cancelMultipartS3("unique-upload-id-123");
+```
+
+### Android 14+ Foreground Service
+`@ammarahmed/react-native-upload` automatically declares `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions along with `MultipartUploadService`. No manual manifest configuration is required in your host application.
+
 # API
 
 ## Top Level Functions
