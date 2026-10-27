@@ -1,0 +1,364 @@
+package com.appfolio.uploader
+
+import android.content.Context
+import android.util.Log
+import com.facebook.react.bridge.*
+import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import okhttp3.Call
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.io.RandomAccessFile
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+class MultipartUploader(private val reactContext: ReactApplicationContext) {
+    companion object {
+        private const val TAG = "MultipartUploader"
+        private const val MIN_CHUNK_SIZE = 5L * 1024 * 1024 // 5MB minimum for S3
+        private const val MAX_RETRIES = 3
+    }
+
+    private data class PartInfo(
+        val partNumber: Int,
+        val url: String,
+        val offset: Long,
+        val size: Long
+    )
+
+    private data class UploadJob(
+        val uploadId: String,
+        val job: CompletableJob = Job(),
+        val isPaused: AtomicBoolean = AtomicBoolean(false),
+        val totalBytes: Long,
+        val bytesUploaded: AtomicLong = AtomicLong(0),
+        val completedChunks: AtomicLong = AtomicLong(0),
+        val partETags: ConcurrentHashMap<Int, String> = ConcurrentHashMap(),
+        val activeCalls: ConcurrentHashMap<Int, Call> = ConcurrentHashMap()
+    )
+
+    private val activeUploads = ConcurrentHashMap<String, UploadJob>()
+
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+
+    private fun emitEvent(eventName: String, params: WritableMap) {
+        try {
+            reactContext.getJSModule(RCTDeviceEventEmitter::class.java)?.emit(eventName, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error emitting event $eventName: ${e.message}")
+        }
+    }
+
+    private fun cleanFilePath(path: String): String {
+        return if (path.startsWith("file://")) {
+            path.substring(7)
+        } else {
+            path
+        }
+    }
+
+    suspend fun startMultipartUpload(options: ReadableMap): WritableMap = withContext(Dispatchers.IO) {
+        val uploadId = options.getString("uploadId")
+            ?: throw IllegalArgumentException("uploadId is required")
+        val rawPath = options.getString("path")
+            ?: throw IllegalArgumentException("path is required")
+        val filePath = cleanFilePath(rawPath)
+
+        val file = File(filePath)
+        if (!file.exists() || !file.isFile) {
+            throw IllegalArgumentException("File does not exist at path: $filePath")
+        }
+
+        val partsArray = options.getArray("parts")
+            ?: throw IllegalArgumentException("parts is required")
+        val partsCount = partsArray.size()
+        if (partsCount == 0) {
+            throw IllegalArgumentException("parts array cannot be empty")
+        }
+
+        val uploadUrls = Array(partsCount) { i -> partsArray.getString(i)!! }
+        val maxParallel = if (options.hasKey("maxParallel") && options.getType("maxParallel") == ReadableType.Number) {
+            options.getInt("maxParallel")
+        } else {
+            3
+        }
+
+        val notificationMap = if (options.hasKey("notification") && options.getType("notification") == ReadableType.Map) {
+            options.getMap("notification")
+        } else null
+
+        val showNotification = notificationMap?.hasKey("enabled") == true && notificationMap.getBoolean("enabled")
+        val filename = notificationMap?.getString("filename") ?: file.name
+
+        val fileSize = file.length()
+        val calculatedChunkSize = Math.ceil(fileSize.toDouble() / partsCount).toLong()
+        val chunkSize = Math.max(calculatedChunkSize, MIN_CHUNK_SIZE)
+
+        val parentJob = coroutineContext[Job] ?: Job()
+        val uploadJob = UploadJob(
+            uploadId = uploadId,
+            job = Job(parentJob),
+            totalBytes = fileSize
+        )
+        activeUploads[uploadId] = uploadJob
+        activeUploads[file.name] = uploadJob
+        activeUploads[file.absolutePath] = uploadJob
+
+        val context: Context? = reactContext.applicationContext
+        if (context != null) {
+            MultipartUploadService.start(context, filename, "Starting upload...")
+        }
+
+        try {
+            withContext(uploadJob.job) {
+                val parts = uploadUrls.mapIndexed { index, url ->
+                    val partNumber = index + 1
+                    val offset = index * chunkSize
+                    val size = if (index == partsCount - 1) {
+                        fileSize - offset
+                    } else {
+                        chunkSize
+                    }
+                    PartInfo(partNumber, url, offset, size)
+                }
+
+                val semaphore = Semaphore(maxParallel)
+                val chunkJobs = parts.map { part ->
+                    async {
+                        semaphore.withPermit {
+                            uploadPart(file, part, uploadJob, filename, showNotification)
+                        }
+                    }
+                }
+
+                chunkJobs.awaitAll()
+
+                if (uploadJob.completedChunks.get() < partsCount) {
+                    throw Exception("Upload incomplete: completed ${uploadJob.completedChunks.get()} of $partsCount chunks")
+                }
+
+                val sortedETags = uploadJob.partETags.toSortedMap().values.toList()
+
+                // Emit completion event
+                val completionParams = Arguments.createMap()
+                completionParams.putString("uploadId", uploadId)
+                completionParams.putBoolean("success", true)
+                val completionEtags = Arguments.createArray()
+                sortedETags.forEach { completionEtags.pushString(it) }
+                completionParams.putArray("etags", completionEtags)
+                emitEvent("RNFileUploader-multipart-completed", completionParams)
+
+                val resultMap = Arguments.createMap()
+                resultMap.putString("uploadId", uploadId)
+                resultMap.putBoolean("success", true)
+                val resultEtags = Arguments.createArray()
+                sortedETags.forEach { resultEtags.pushString(it) }
+                resultMap.putArray("etags", resultEtags)
+                resultMap
+            }
+        } catch (e: CancellationException) {
+            if (context != null) {
+                MultipartUploadService.stop(context)
+            }
+            val cancelParams = Arguments.createMap()
+            cancelParams.putString("uploadId", uploadId)
+            cancelParams.putString("error", "Upload cancelled")
+            emitEvent("RNFileUploader-multipart-cancelled", cancelParams)
+            throw e
+        } catch (e: Exception) {
+            if (context != null) {
+                MultipartUploadService.stop(context)
+            }
+            Log.e(TAG, "Multipart upload failed for $uploadId: ${e.message}", e)
+            val errorParams = Arguments.createMap()
+            errorParams.putString("uploadId", uploadId)
+            errorParams.putString("error", e.message ?: "Upload failed")
+            emitEvent("RNFileUploader-multipart-error", errorParams)
+            throw e
+        } finally {
+            activeUploads.remove(uploadId)
+            activeUploads.remove(file.name)
+            activeUploads.remove(file.absolutePath)
+            if (activeUploads.isEmpty() && context != null) {
+                MultipartUploadService.stop(context)
+            }
+        }
+    }
+
+    private suspend fun uploadPart(
+        file: File,
+        part: PartInfo,
+        uploadJob: UploadJob,
+        filename: String,
+        showNotification: Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (uploadJob.partETags.containsKey(part.partNumber)) {
+            return@withContext true
+        }
+
+        var retries = 0
+        var lastError: Exception? = null
+
+        while (retries < MAX_RETRIES) {
+            while (uploadJob.isPaused.get()) {
+                delay(500)
+            }
+
+            if (!isActive || uploadJob.job.isCancelled) {
+                throw CancellationException("Upload cancelled")
+            }
+
+            try {
+                if (!file.exists()) {
+                    uploadJob.activeCalls.values.forEach { call ->
+                        try { call.cancel() } catch (_: Exception) {}
+                    }
+                    uploadJob.job.cancel()
+                    val ctx = reactContext.applicationContext
+                    if (ctx != null) {
+                        MultipartUploadService.stop(ctx)
+                    }
+                    throw CancellationException("Upload cancelled: file deleted")
+                }
+
+                val chunkData = readChunk(file, part.offset, part.size)
+                val mediaType = "application/octet-stream".toMediaTypeOrNull()
+                val requestBody = chunkData.toRequestBody(mediaType)
+
+                val request = Request.Builder()
+                    .url(part.url)
+                    .put(requestBody)
+                    .addHeader("Content-Type", "application/octet-stream")
+                    .addHeader("Content-Length", part.size.toString())
+                    .build()
+
+                val call = httpClient.newCall(request)
+                uploadJob.activeCalls[part.partNumber] = call
+
+                val response = try {
+                    call.execute()
+                } finally {
+                    uploadJob.activeCalls.remove(part.partNumber)
+                }
+
+                if (!response.isSuccessful) {
+                    val errorBody = response.body?.string() ?: ""
+                    throw Exception("HTTP ${response.code}: $errorBody")
+                }
+
+                val etag = response.header("ETag")?.trim('"')
+                    ?: response.header("etag")?.trim('"')
+                    ?: ""
+
+                if (etag.isEmpty()) {
+                    throw Exception("No ETag in response for part ${part.partNumber}")
+                }
+
+                synchronized(uploadJob) {
+                    if (!uploadJob.partETags.containsKey(part.partNumber)) {
+                        uploadJob.partETags[part.partNumber] = etag
+                        uploadJob.completedChunks.incrementAndGet()
+                        uploadJob.bytesUploaded.addAndGet(part.size)
+                    }
+                }
+
+                val progress = if (uploadJob.totalBytes > 0) {
+                    uploadJob.bytesUploaded.get().toDouble() / uploadJob.totalBytes.toDouble()
+                } else 1.0
+
+                val progressParams = Arguments.createMap()
+                progressParams.putString("uploadId", uploadJob.uploadId)
+                progressParams.putDouble("progress", progress)
+                progressParams.putDouble("bytesUploaded", uploadJob.bytesUploaded.get().toDouble())
+                progressParams.putDouble("totalBytes", uploadJob.totalBytes.toDouble())
+                progressParams.putInt("chunkIndex", part.partNumber - 1)
+                emitEvent("RNFileUploader-multipart-progress", progressParams)
+
+                val context: Context? = reactContext.applicationContext
+                if (context != null) {
+                    val percent = (progress * 100).toInt()
+                    MultipartUploadService.updateProgress(context, filename, percent, "Uploading... $percent%")
+                }
+
+                return@withContext true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e is java.io.FileNotFoundException || !file.exists()) {
+                    uploadJob.activeCalls.values.forEach { call ->
+                        try { call.cancel() } catch (_: Exception) {}
+                    }
+                    uploadJob.job.cancel()
+                    val ctx = reactContext.applicationContext
+                    if (ctx != null) {
+                        MultipartUploadService.stop(ctx)
+                    }
+                    throw CancellationException("Upload cancelled: file deleted")
+                }
+                lastError = e
+                retries++
+                Log.w(TAG, "Part ${part.partNumber} failed (attempt $retries): ${e.message}")
+                if (retries < MAX_RETRIES) {
+                    delay(1000L * retries)
+                }
+            }
+        }
+
+        throw lastError ?: Exception("Part ${part.partNumber} failed after $MAX_RETRIES retries")
+    }
+
+    private fun readChunk(file: File, offset: Long, size: Long): ByteArray {
+        RandomAccessFile(file, "r").use { raf ->
+            if (offset + size > raf.length()) {
+                throw IllegalArgumentException("Invalid chunk bounds: offset=$offset, size=$size, file=${raf.length()}")
+            }
+            raf.seek(offset)
+            val buffer = ByteArray(size.toInt())
+            val bytesRead = raf.read(buffer)
+            if (bytesRead != size.toInt()) {
+                throw Exception("Read $bytesRead bytes, expected $size")
+            }
+            return buffer
+        }
+    }
+
+    fun cancelUpload(uploadIdOrKey: String): Boolean {
+        val uploadJob = activeUploads[uploadIdOrKey] ?: return false
+        uploadJob.activeCalls.values.forEach { call ->
+            try {
+                call.cancel()
+            } catch (_: Exception) {}
+        }
+        uploadJob.job.cancel()
+        activeUploads.remove(uploadJob.uploadId)
+        val context = reactContext.applicationContext
+        if (context != null) {
+            MultipartUploadService.stop(context)
+        }
+        return true
+    }
+
+    fun pauseUpload(uploadId: String): Boolean {
+        val uploadJob = activeUploads[uploadId] ?: return false
+        uploadJob.isPaused.set(true)
+        return true
+    }
+
+    fun resumeUpload(uploadId: String): Boolean {
+        val uploadJob = activeUploads[uploadId] ?: return false
+        uploadJob.isPaused.set(false)
+        return true
+    }
+}

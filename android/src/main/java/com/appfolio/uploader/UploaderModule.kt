@@ -28,6 +28,7 @@ import net.gotev.uploadservice.protocols.multipart.MultipartUploadRequest
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.*
 
 class UploaderModule(val reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
   private val TAG = "UploaderBridge"
@@ -399,12 +400,62 @@ class UploaderModule(val reactContext: ReactApplicationContext) : ReactContextBa
     }
   }
 
+  private val multipartUploader by lazy { MultipartUploader(reactContext) }
+  private val moduleScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+  @ReactMethod
+  fun startMultipartUpload(options: ReadableMap, promise: Promise) {
+    moduleScope.launch {
+      try {
+        val result = multipartUploader.startMultipartUpload(options)
+        promise.resolve(result)
+      } catch (e: CancellationException) {
+        promise.reject("CANCELLED", "Upload cancelled")
+      } catch (e: Throwable) {
+        promise.reject("MULTIPART_UPLOAD_ERROR", e.message, e)
+      }
+    }
+  }
+
+  @ReactMethod
+  fun cancelMultipartUpload(uploadId: String, promise: Promise) {
+    try {
+      val success = multipartUploader.cancelUpload(uploadId)
+      promise.resolve(success)
+    } catch (e: Exception) {
+      promise.reject("CANCEL_ERROR", e.message, e)
+    }
+  }
+
+  @ReactMethod
+  fun pauseMultipartUpload(uploadId: String, promise: Promise) {
+    try {
+      val success = multipartUploader.pauseUpload(uploadId)
+      promise.resolve(success)
+    } catch (e: Exception) {
+      promise.reject("PAUSE_ERROR", e.message, e)
+    }
+  }
+
+  @ReactMethod
+  fun resumeMultipartUpload(uploadId: String, promise: Promise) {
+    try {
+      val success = multipartUploader.resumeUpload(uploadId)
+      promise.resolve(success)
+    } catch (e: Exception) {
+      promise.reject("RESUME_ERROR", e.message, e)
+    }
+  }
+
+  override fun onHostDestroy() {
+    moduleScope.cancel()
+  }
+
   override fun onHostResume() {
   }
 
   override fun onHostPause() {
   }
 
-  override fun onHostDestroy() {
-  }
+
 }
