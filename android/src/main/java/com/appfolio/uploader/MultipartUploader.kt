@@ -38,9 +38,9 @@ class MultipartUploader(private val reactContext: ReactApplicationContext) {
         val job: CompletableJob = Job(),
         val isPaused: AtomicBoolean = AtomicBoolean(false),
         val totalBytes: Long,
-        val bytesUploaded: AtomicLong = AtomicLong(0),
-        val completedChunks: AtomicLong = AtomicLong(0),
-        val partETags: ConcurrentHashMap<Int, String> = ConcurrentHashMap(),
+        val bytesUploaded: AtomicLong,
+        val completedChunks: AtomicLong,
+        val partETags: ConcurrentHashMap<Int, String>,
         val activeCalls: ConcurrentHashMap<Int, Call> = ConcurrentHashMap()
     )
 
@@ -106,11 +106,37 @@ class MultipartUploader(private val reactContext: ReactApplicationContext) {
         val calculatedChunkSize = Math.ceil(fileSize.toDouble() / partsCount).toLong()
         val chunkSize = Math.max(calculatedChunkSize, MIN_CHUNK_SIZE)
 
+        val existingEtagsArray = if (options.hasKey("existingEtags") && options.getType("existingEtags") == ReadableType.Array) {
+            options.getArray("existingEtags")
+        } else null
+
+        val initialETags = ConcurrentHashMap<Int, String>()
+        var initialUploadedBytes = 0L
+        var initialCompleted = 0L
+
+        if (existingEtagsArray != null) {
+            val count = Math.min(existingEtagsArray.size(), partsCount)
+            for (i in 0 until count) {
+                val etag = existingEtagsArray.getString(i)
+                if (!etag.isNullOrEmpty()) {
+                    val partNumber = i + 1
+                    val offset = i * chunkSize
+                    val size = if (i == partsCount - 1) fileSize - offset else chunkSize
+                    initialETags[partNumber] = etag
+                    initialUploadedBytes += size
+                    initialCompleted++
+                }
+            }
+        }
+
         val parentJob = coroutineContext[Job] ?: Job()
         val uploadJob = UploadJob(
             uploadId = uploadId,
             job = Job(parentJob),
-            totalBytes = fileSize
+            totalBytes = fileSize,
+            bytesUploaded = AtomicLong(initialUploadedBytes),
+            completedChunks = AtomicLong(initialCompleted),
+            partETags = initialETags
         )
         activeUploads[uploadId] = uploadJob
         activeUploads[file.name] = uploadJob
@@ -118,7 +144,21 @@ class MultipartUploader(private val reactContext: ReactApplicationContext) {
 
         val context: Context? = reactContext.applicationContext
         if (context != null) {
-            MultipartUploadService.start(context, filename, "Starting upload...")
+            val startMsg = if (initialUploadedBytes > 0) "Resuming upload..." else "Starting upload..."
+            MultipartUploadService.start(context, filename, startMsg)
+        }
+
+        if (initialUploadedBytes > 0) {
+            val progress = if (fileSize > 0) {
+                initialUploadedBytes.toDouble() / fileSize.toDouble()
+            } else 1.0
+            val progressParams = Arguments.createMap()
+            progressParams.putString("uploadId", uploadId)
+            progressParams.putDouble("progress", progress)
+            progressParams.putDouble("bytesUploaded", initialUploadedBytes.toDouble())
+            progressParams.putDouble("totalBytes", fileSize.toDouble())
+            progressParams.putInt("chunkIndex", (initialCompleted - 1).toInt())
+            emitEvent("RNFileUploader-multipart-progress", progressParams)
         }
 
         try {
@@ -284,6 +324,10 @@ class MultipartUploader(private val reactContext: ReactApplicationContext) {
                 progressParams.putDouble("bytesUploaded", uploadJob.bytesUploaded.get().toDouble())
                 progressParams.putDouble("totalBytes", uploadJob.totalBytes.toDouble())
                 progressParams.putInt("chunkIndex", part.partNumber - 1)
+                progressParams.putString("etag", etag)
+                val currentEtags = Arguments.createArray()
+                uploadJob.partETags.toSortedMap().values.forEach { currentEtags.pushString(it) }
+                progressParams.putArray("etags", currentEtags)
                 emitEvent("RNFileUploader-multipart-progress", progressParams)
 
                 val context: Context? = reactContext.applicationContext

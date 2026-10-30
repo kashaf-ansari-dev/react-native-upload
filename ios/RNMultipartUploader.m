@@ -76,6 +76,20 @@ static NSInteger const MAX_RETRIES = 3;
         int64_t calculatedChunkSize = (int64_t)ceil((double)_totalBytes / (double)_uploadUrls.count);
         _chunkSize = MAX(calculatedChunkSize, MIN_CHUNK_SIZE);
 
+        NSArray *existingEtags = options[@"existingEtags"];
+        if (existingEtags && [existingEtags isKindOfClass:[NSArray class]]) {
+            for (NSUInteger i = 0; i < existingEtags.count && i < _uploadUrls.count; i++) {
+                NSString *etag = existingEtags[i];
+                if ([etag isKindOfClass:[NSString class]] && etag.length > 0) {
+                    _etags[i] = etag;
+                    [_completedChunks addObject:@(i)];
+                    int64_t offset = (int64_t)i * _chunkSize;
+                    int64_t size = (i == _uploadUrls.count - 1) ? (_totalBytes - offset) : _chunkSize;
+                    _bytesUploaded += size;
+                }
+            }
+        }
+
         NSString *sessionId = [NSString stringWithFormat:@"com.reactnativeupload.multipart.%@", _uploadId];
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessionId];
         config.isDiscretionary = NO;
@@ -94,6 +108,23 @@ static NSInteger const MAX_RETRIES = 3;
 - (void)start {
     dispatch_async(self.queue, ^{
         if (self.hasEnded) return;
+
+        if (self.bytesUploaded > 0 && self.eventEmitter) {
+            double progress = self.totalBytes > 0 ? (double)self.bytesUploaded / (double)self.totalBytes : 1.0;
+            self.eventEmitter(@"RNFileUploader-multipart-progress", @{
+                @"uploadId": self.uploadId,
+                @"progress": @(progress),
+                @"bytesUploaded": @(self.bytesUploaded),
+                @"totalBytes": @(self.totalBytes),
+                @"chunkIndex": @(self.completedChunks.count - 1)
+            });
+        }
+
+        if (self.completedChunks.count == self.uploadUrls.count) {
+            [self finishSuccess];
+            return;
+        }
+
         [self uploadNextChunks];
     });
 }
@@ -317,12 +348,18 @@ static NSInteger const MAX_RETRIES = 3;
         double progress = self.totalBytes > 0 ? (double)self.bytesUploaded / (double)self.totalBytes : 1.0;
 
         if (self.eventEmitter) {
+            NSMutableArray<NSString *> *validEtags = [NSMutableArray array];
+            for (NSString *e in self.etags) {
+                if (e.length > 0) [validEtags addObject:e];
+            }
             self.eventEmitter(@"RNFileUploader-multipart-progress", @{
                 @"uploadId": self.uploadId,
                 @"progress": @(progress),
                 @"bytesUploaded": @(self.bytesUploaded),
                 @"totalBytes": @(self.totalBytes),
-                @"chunkIndex": @(index)
+                @"chunkIndex": @(index),
+                @"etag": etag ?: @"",
+                @"etags": validEtags
             });
         }
 

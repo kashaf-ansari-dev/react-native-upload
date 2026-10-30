@@ -132,6 +132,11 @@ export interface MultipartS3Options {
      * AppGroup defined in Xcode for extensions (iOS).
      */
     appGroup?: string;
+    /**
+     * Array of previously uploaded chunk ETags (in order) for resuming an existing upload session.
+     * Already uploaded chunks will be skipped and pre-filled with these ETags.
+     */
+    existingEtags?: string[];
 }
 export interface MultipartProgressEvent {
     type: string;
@@ -140,6 +145,8 @@ export interface MultipartProgressEvent {
     bytesUploaded?: number;
     totalBytes?: number;
     chunkIndex?: number;
+    etag?: string;
+    etags?: string[];
     errorMessage?: string;
 }
 export interface MultipartS3Result {

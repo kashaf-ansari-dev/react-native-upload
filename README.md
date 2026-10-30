@@ -189,6 +189,19 @@ try {
 // await Upload.cancelMultipartS3("unique-upload-id-123");
 ```
 
+### Resumption on Network Failure
+
+If an upload is interrupted or network drops, you can resume by passing `existingEtags`:
+
+```typescript
+const upload = Upload.createMultipartS3({
+  uploadId: savedUploadId, // Re-use the existing S3 upload ID
+  path: "/path/to/large-video.mp4",
+  parts: presignedUrls,
+  existingEtags: savedEtags, // Chunks 0..(savedEtags.length - 1) will be skipped
+});
+```
+
 ### Android 14+ Foreground Service
 `@ammarahmed/react-native-upload` automatically declares `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions along with `MultipartUploadService`. No manual manifest configuration is required in your host application.
 
